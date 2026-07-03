@@ -1,0 +1,19 @@
+[Unit]
+Description=V620 full-throttle llama.cpp burn-in (continuous llama-bench, ROCm)
+After=docker.service
+Requires=docker.service
+
+[Service]
+# Persistent / non-ephemeral: auto-starts on boot, restarts on failure.
+Restart=always
+RestartSec=10
+ExecStartPre=-/usr/bin/docker rm -f llama-gpu-stress
+ExecStart=/usr/bin/docker run --rm --name llama-gpu-stress \
+  --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined --group-add video \
+  -v /data/models/llm-models:/models \
+  --entrypoint bash ghcr.io/ggml-org/llama.cpp:server-rocm \
+  -c 'while true; do /app/llama bench -m /models/ornith-1.0-35b-Q4_K_M.gguf -ngl 99 -p 4096 -n 512 || sleep 5; done'
+ExecStop=-/usr/bin/docker stop llama-gpu-stress
+
+[Install]
+WantedBy=multi-user.target

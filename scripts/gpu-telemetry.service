@@ -1,0 +1,12 @@
+[Unit]
+Description=V620 GPU telemetry logger (host sysfs -> /var/log/gpu-stress/telemetry.csv)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/root/gpu-telemetry.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

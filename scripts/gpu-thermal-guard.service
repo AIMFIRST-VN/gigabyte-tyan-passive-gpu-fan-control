@@ -1,0 +1,13 @@
+[Unit]
+Description=V620 thermal guard (caps GPU clocks when hot; fanless-card safety net)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/root/gpu-thermal-guard.sh
+Restart=always
+RestartSec=5
+# Tune via drop-in or env if needed: HOT=90 COOL=82 INTERVAL=3
+
+[Install]
+WantedBy=multi-user.target
