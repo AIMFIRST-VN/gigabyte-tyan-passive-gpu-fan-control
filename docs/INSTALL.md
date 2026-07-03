@@ -79,5 +79,10 @@ survives reboots — no host daemon required.
 Standard Redfish reads the fan profile but rejects writes (`405` / `400`). The web
 UI uses a proprietary `/api/` interface: `POST /api/session` (form login) returns a
 CSRF token and sets a session cookie; every write carries the cookie **and** an
-`X-CSRFTOKEN` header. `scripts/apply-fan-profile.py` reproduces exactly that. The
+`X-CSRFTOKEN` header.
+
+The session **expires after the BMC's idle timeout (~30 min)** — any call then
+returns `401`. `scripts/apply-fan-profile.py` handles this: it **re-authenticates
+automatically on a 401**, and always **logs out** (`DELETE /api/session`) when done
+so it never leaks sessions (the BMC caps concurrent sessions). The
 full reverse-engineering story is in [`blog.md`](blog.md).

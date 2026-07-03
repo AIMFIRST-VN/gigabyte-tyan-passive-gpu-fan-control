@@ -28,6 +28,28 @@ whole family — all with the same BMC and the same fan-control gap:
 
 ## How it works
 
+```mermaid
+flowchart TD
+    load([Passive GPU under load])
+
+    subgraph read["Sensors the BMC CAN read — not the GPU die temp"]
+      cur["12V_GPU0 current<br/>(GPU watts · leading indicator)"]
+      cpu["CPU temperature"]
+      sys["SYS_POWER<br/>(total system watts)"]
+    end
+
+    subgraph prof["Layered fan profile in BMC NVRAM — each fan runs at the MAX any policy demands"]
+      f12["FAN 1 / 2  (GPU + CPU side)<br/>= max( GPU-current , CPU-temp , SYS_POWER )"]
+      f34["FAN 3 / 4  (extra-GPU side)<br/>= staged: silent for one GPU,<br/>ramps only when total power reveals a 2nd/3rd card"]
+      safe["safety: any CPU >= 91 C  ->  all fans 100%"]
+    end
+
+    fans([Chassis fans ramp in proportion<br/>near-silent at idle · full only when earned])
+
+    load --> read --> prof --> fans
+    fans -. airflow .-> load
+```
+
 The standard Redfish API *reads* the fan profile but refuses to *write* it (`405`
 / `400`). The BMC web UI changes profiles over a proprietary `/api/` interface:
 log in for a CSRF token + session cookie, then `POST` the fan profile back.

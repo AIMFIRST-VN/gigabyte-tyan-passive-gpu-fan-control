@@ -53,6 +53,18 @@ class FanBmc:
         self._csrf = None
 
     def __enter__(self):
+        self._login()
+        return self
+
+    def __exit__(self, *exc):
+        try:  # invalidate the session server-side so a leaked cookie is useless
+            self.session.delete(self.base + "/api/session", headers={"X-CSRFTOKEN": self._csrf}, timeout=self.timeout)
+        except Exception:
+            pass
+        self.session.close()
+
+    def _login(self):
+        """(Re)authenticate: POST /api/session -> CSRF token + QSESSIONID cookie."""
         r = self.session.post(
             self.base + "/api/session",
             data={"username": self.user, "password": self.password},
@@ -66,24 +78,25 @@ class FanBmc:
             raise BmcError("login response was not JSON")
         if not self._csrf:
             raise BmcError("no CSRF token in login response")
-        return self
 
-    def __exit__(self, *exc):
-        try:  # invalidate the session server-side so a leaked cookie is useless
-            self.session.delete(self.base + "/api/session", headers=self._headers(), timeout=self.timeout)
-        except Exception:
-            pass
-        self.session.close()
+    def _request(self, method, path, *, body=None):
+        """One API call. The BMC session (cookie + CSRF) expires after its idle
+        timeout (default ~30 min) -> HTTP 401; on a 401 we re-login once and retry,
+        so a long-lived caller never dies on an expired session."""
+        def send():
+            headers = {"X-CSRFTOKEN": self._csrf}
+            data = None
+            if body is not None:
+                headers["Content-Type"] = "application/json"
+                data = json.dumps(body)
+            return self.session.request(method, self.base + path, headers=headers, data=data, timeout=self.timeout)
 
-    def _headers(self, json_body=False):
-        h = {"X-CSRFTOKEN": self._csrf}
-        if json_body:
-            h["Content-Type"] = "application/json"
-        return h
-
-    def _json(self, r):
+        r = send()
+        if r.status_code == 401:            # session/CSRF expired or invalid -> re-auth once
+            self._login()
+            r = send()
         if r.status_code >= 400:
-            raise BmcError(f"HTTP {r.status_code} for {r.request.method} {r.url}")
+            raise BmcError(f"HTTP {r.status_code} for {method} {path}")
         try:
             return r.json()
         except ValueError:
@@ -91,21 +104,21 @@ class FanBmc:
 
     # -- reads --
     def get_profile(self):
-        return self._json(self.session.get(self.base + FANPROFILE, headers=self._headers(), timeout=self.timeout))
+        return self._request("GET", FANPROFILE)
 
     def get_mode(self):
-        return self._json(self.session.get(self.base + MODE, headers=self._headers(), timeout=self.timeout)).get("strMode")
+        return self._request("GET", MODE).get("strMode")
 
     # -- writes (each verified by read-back) --
     def set_profile(self, doc):
-        self._json(self.session.post(self.base + FANPROFILE, headers=self._headers(True), data=json.dumps(doc), timeout=self.timeout))
+        self._request("POST", FANPROFILE, body=doc)
         want = {p.get("strName") for p in doc.get("arrProfile", [])}
         got = {p.get("strName") for p in self.get_profile().get("arrProfile", [])}
         if not want <= got:
             raise BmcError(f"write not confirmed — missing profiles: {sorted(want - got)}")
 
     def set_mode(self, name):
-        self._json(self.session.post(self.base + MODE, headers=self._headers(True), data=json.dumps({"strMode": name}), timeout=self.timeout))
+        self._request("POST", MODE, body={"strMode": name})
         now = self.get_mode()
         if now != name:
             raise BmcError(f"activate not confirmed — mode is {now!r}, wanted {name!r}")
