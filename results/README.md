@@ -1,6 +1,6 @@
 # Results
 
-## Baseline — `.202` consumer desktop (adaptive `thermal_bench.py`)
+## Baseline — consumer desktop (adaptive `thermal_bench.py`)
 The desktop run was thermally throttled (boost/cooldown gates) to survive limited cooling.
 Raw llama-bench numbers are in the original setup transcript; representative baseline to be
 copied here for comparison.

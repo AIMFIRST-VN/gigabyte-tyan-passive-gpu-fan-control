@@ -4,18 +4,18 @@
  "arrPolicy": [
   {
    "arrDuty": [
-    3,
+    12,
     80
    ],
    "iSensorCode": 1,
    "arrHexDeviceID": [],
    "iInSDR": 1,
    "arrRef": [
-    55,
+    68,
     88
    ],
    "iCpuTdp": 0,
-   "iInitDuty": 3,
+   "iInitDuty": 12,
    "arrHexVendorID": [],
    "iAmbientSensorTemp": 0,
    "arrSensor": [
@@ -32,18 +32,18 @@
   },
   {
    "arrDuty": [
-    3,
+    12,
     100
    ],
    "iSensorCode": 1,
    "arrHexDeviceID": [],
    "iInSDR": 1,
    "arrRef": [
-    55,
+    68,
     88
    ],
    "iCpuTdp": 0,
-   "iInitDuty": 3,
+   "iInitDuty": 12,
    "arrHexVendorID": [],
    "iAmbientSensorTemp": 28,
    "arrSensor": [
@@ -349,9 +349,9 @@
    "arrHexDeviceID": [],
    "iInSDR": 1,
    "arrRef": [
-    28,
-    30,
-    32
+    38,
+    44,
+    50
    ],
    "iCpuTdp": 0,
    "iInitDuty": 3,

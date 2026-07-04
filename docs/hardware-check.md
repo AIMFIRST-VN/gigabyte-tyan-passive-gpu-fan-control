@@ -4,7 +4,7 @@ Short burn-in / acceptance plan for a **second-hand** server before trusting it 
 Run top-to-bottom; anything not "clean" gets investigated before sign-off.
 
 ## 0. BMC first — look for a history of prior faults
-- iKVM/web: `https://192.168.1.11` (`admin`). Review the **System Event Log** for past thermal/power/ECC events:
+- iKVM/web: `https://bmc.example.lan` (`admin`). Review the **System Event Log** for past thermal/power/ECC events:
   `ipmitool sel elist | tail -40` — anything beyond normal presence/boot/clock lines is suspect.
 - Sensors: `ipmitool sdr type Temperature`, `... Fan`, `... Voltage`, `... "Power Supply"` (both PSUs present + healthy → redundancy).
 - Clear the SEL after review so new faults stand out during burn-in: `ipmitool sel clear`.

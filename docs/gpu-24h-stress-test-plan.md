@@ -3,8 +3,8 @@
 **For review.** Goal: prove the R282-Z93 can sustain the Radeon Pro V620 at **full clocks for 24 h**
 under a realistic llama.cpp workload — i.e. verify **cooling + power + stability** on server-grade hardware.
 
-## Why this differs from the `.202` bench
-The original `scripts/thermal_bench.py` was written for a **consumer desktop** (`.202`) with weak
+## Why this differs from the desktop bench
+The original `scripts/thermal_bench.py` was written for a **consumer desktop** with weak
 cooling: it *adaptively throttled* — bursting the GPU, then forcing low clocks (`pp_dpm_sclk`) with
 cooldown gates (boost ≤75 °C, cooldown ≥85 °C, hard ceiling 90 °C) just to survive.
 
@@ -41,8 +41,8 @@ The R282-Z93 is a **2U server with high-static-pressure blowers**, so the plan i
 ## Monitoring during the run
 - `journalctl -u llama-gpu-stress -f` and `tail -f /var/log/gpu-stress/telemetry.csv`
 - `docker logs -f llama-gpu-stress`
-- BMC (`https://192.168.1.11`) sensors + SEL for chassis-level temps/fans/power.
+- BMC (`https://bmc.example.lan`) sensors + SEL for chassis-level temps/fans/power.
 
 ## Baseline
-Desktop (`.202`) numbers are in the setup transcript; gpu-server results land in `../results/`.
+Desktop numbers are in the setup transcript; gpu-server results land in `../results/`.
 Expectation: gpu-server should sustain **higher, flatter** clocks/tok/s than the throttled desktop run.
