@@ -1,0 +1,18 @@
+[Unit]
+Description=Tyan chassis fan control (GPU/CPU/NVMe/mem temp-driven, in-band IPMI)
+After=multi-user.target
+StartLimitIntervalSec=120
+StartLimitBurst=6
+OnFailure=gpu-fan-restore.service
+[Service]
+Type=notify
+NotifyAccess=all
+WatchdogSec=25
+ExecStart=/root/gpu-fan-control.sh
+ExecStopPost=/bin/sh -c 'for p in 2 3 4 5 6 0; do ipmitool raw 0x2e 0x05 0xfd 0x19 0x00 $p 0xff; done'
+Restart=always
+RestartSec=2
+Nice=-10
+OOMScoreAdjust=-900
+[Install]
+WantedBy=multi-user.target
