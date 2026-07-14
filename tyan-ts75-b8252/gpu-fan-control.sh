@@ -17,8 +17,9 @@ PWMS="2 3 4 5 6 0"; IANA="0xfd 0x19 0x00"
 # Left/right split (chassis, seen from the FRONT): SYS_FAN_1..3 = PWM 2,3,4 (LEFT, over the GPU) do the cooling;
 # SYS_FAN_4..6 = PWM 5,6,0 (RIGHT) run minimal for noise. The SAFETY VALVE overrides BOTH toward 100%.
 LEFT_PWMS="${LEFT_PWMS:-2 3 4}"; RIGHT_PWMS="${RIGHT_PWMS:-5 6 0}"
-RIGHT_MIN=${RIGHT_MIN:-15}          # right-bank floor % (noise). The GPU is the LEFT bank's job, so a hot GPU does
-                                    # NOT ramp the right bank (see below) — only a CPU/NVMe/mem emergency does.
+RIGHT_BOOST=${RIGHT_BOOST:-10}      # right bank runs this many % ABOVE the left. With the chassis half-taped the
+                                    # right-side air travels further to reach the GPU, so it pushes harder for the
+                                    # same cooling. Right can exceed MAX_DUTY by this margin (up to 100%).
 # Day/night noise CAP on the (left) cooling fans -- host clock is Asia/Ho_Chi_Minh. Quieter at night; the GPU
 # temp-gate on the app side paces work so a capped fan doesn't overheat (the valve is the hard safety net).
 DAY_START=${DAY_START:-7}; DAY_END=${DAY_END:-19}; DAY_CAP=${DAY_CAP:-50}; NIGHT_CAP=${NIGHT_CAP:-25}
@@ -95,14 +96,10 @@ while :; do
   cap=$(day_cap); [ "$dcool" -gt "$cap" ] && dcool=$cap          # day/night noise cap on the cooling bank
   # LEFT bank cools (capped); RIGHT bank stays minimal for noise; the safety VALVE overrides BOTH.
   dl=$dcool; [ "$dv" -gt "$dl" ] && dl=$dv
-  # RIGHT bank: the GPU is the LEFT bank's job, so exclude the GPU junction/VRAM layers from its stack — the
-  # right bank only ramps on its OWN emergency (CPU / NVMe / memory crit). "Max layered wins", but the GPU
-  # layer is no longer IN the right stack, so a hot GPU never spins the right fans up.
-  dvr=0; for x in "$(ramp "$ct" "$CPU_CRIT_LO" "$CPU_CRIT_HI")" "$(ramp "$nt" "$NVME_CRIT_LO" "$NVME_CRIT_HI")" "$(ramp "$mt" "$MEM_CRIT_LO" "$MEM_CRIT_HI")"; do [ "$x" -gt "$dvr" ] && dvr=$x; done
-  dr=$RIGHT_MIN; [ "$dvr" -gt "$dr" ] && dr=$dvr
-  # HARD ceiling (noise budget) — caps even the valve; thermal safety falls to the temp-gate + thermal-guard.
+  # HARD ceiling (noise budget) on the LEFT bank.
   [ "$dl" -gt "$MAX_DUTY" ] && dl=$MAX_DUTY; [ "$dl" -lt 0 ] && dl=0
-  [ "$dr" -gt "$MAX_DUTY" ] && dr=$MAX_DUTY; [ "$dr" -lt 0 ] && dr=0
+  # RIGHT bank runs RIGHT_BOOST points ABOVE the left (its air travels further to the GPU under the tape).
+  dr=$(( dl + RIGHT_BOOST )); [ "$dr" -gt 100 ] && dr=100; [ "$dr" -lt 0 ] && dr=0
   if [ "$dl" -ne "$lastL" ] || [ "$dr" -ne "$lastR" ]; then
     hl=$(printf '0x%02x' "$dl"); hr=$(printf '0x%02x' "$dr")
     for p in $LEFT_PWMS; do setfan "$p" "$hl"; done

@@ -1,78 +1,75 @@
 #!/usr/bin/env bash
-# tyan-thermal-soak.sh -- GPU / CPU / combined thermal soak + live monitor for the
-# Tyan TS75-B8252 (S8252) with a passive Radeon Pro V620.
+# tyan-thermal-soak.sh -- controlled CPU% / GPU thermal LOAD + VERIFY + monitor for the
+# Tyan TS75-B8252 (S8252) with a passive Radeon Pro V620.  (Board-agnostic except the
+# fan-RPM SDR sensor names.)
 #
-# Drives the chassis fans via gpu-fan-control.service (optionally set a profile),
-# applies the chosen load, logs GPU junction/edge + CPU Tctl + fan RPM + GPU busy to
-# a CSV, prints a live table, and ABORTS if the GPU junction or CPU Tctl crosses a cap.
+# Uses ONE general tool -- stress-ng -- for BOTH loads (no model, no VRAM juggling, no need
+# to stop the vision server): --cpu-load gives a verifiable PARTIAL CPU load, --gpu drives
+# the GPU via Mesa/radeonsi GL. Every few seconds it VERIFIES and prints the ACTUAL load it
+# achieved -- CPU busy% (mpstat) and GPU busy% (sysfs) -- next to CPU Tctl, GPU junction/edge
+# and LEFT/RIGHT fan RPM, so you get a real measured "50% CPU + 100% GPU" baseline to size
+# the fan duty cap / OCR worker count against. Logs CSV, scans ECC/RAS/MCE/AER, aborts on cap.
 #
-# Usage:  tyan-thermal-soak.sh [gpu|cpu|both] [minutes] [profile]
-#   defaults: both  10  (leave profile unset to keep the current one)
-# Needs: docker + the llama.cpp ROCm image & model (GPU load), stress-ng or coreutils
-#        `yes` (CPU load), ipmitool, and the gpu-fan-control service installed.
+# Usage:  tyan-thermal-soak.sh [gpu|cpu|both|all] [minutes] [profile]
+#   env:  CPU_PCT=50   load EVERY core to 50% (default 100 = flat out) -- the point of the tool
+#         NGPU=1       number of stress-ng GPU workers (default 1)
+#         CARD=/sys/class/drm/card1/device  LFAN=SYS_FAN_1  RFAN=SYS_FAN_4  GABORT=100 CABORT=95
+#   defaults: both 10  (profile unset = keep the current gpu-fan-control profile)
+# Needs: stress-ng (both loads), sysstat/mpstat (CPU verify), ipmitool, gpu-fan-control service.
 set -u
 LOAD=${1:-both}; MIN=${2:-10}; PROFILE=${3:-}
-GABORT=${GABORT:-100}      # GPU junction abort (Tjunction/throttle is 110C)
+CPU_PCT=${CPU_PCT:-100}; NGPU=${NGPU:-1}
+GABORT=${GABORT:-100}      # GPU junction abort (Tjunction/throttle 110C)
 CABORT=${CABORT:-95}       # EPYC Tctl abort (Rome Tjmax ~95C)
-IMG=ghcr.io/ggml-org/llama.cpp:server-rocm
-MODEL=/models/llm-models/ornith-1.0-35b-Q4_K_M.gguf
-CARD=/sys/class/drm/card1/device
+CARD=${CARD:-/sys/class/drm/card1/device}
+LFAN=${LFAN:-SYS_FAN_1}; RFAN=${RFAN:-SYS_FAN_4}   # left(cooling) / right(far) bank sample
 CSV=/var/log/tyan-soak-$(date +%Y%m%d-%H%M%S).csv
 CHW=""; for h in /sys/class/hwmon/hwmon*; do [ "$(cat "$h/name" 2>/dev/null)" = k10temp ] && CHW="$h" && break; done
 
 gj(){ echo $(( $(cat "$CARD"/hwmon/hwmon*/temp2_input 2>/dev/null||echo 0)/1000 )); }   # junction
 ge(){ echo $(( $(cat "$CARD"/hwmon/hwmon*/temp1_input 2>/dev/null||echo 0)/1000 )); }   # edge
 ct(){ [ -n "$CHW" ] && echo $(( $(cat "$CHW"/temp1_input 2>/dev/null||echo 0)/1000 )) || echo 0; }
-fan(){ ipmitool sdr type Fan 2>/dev/null|grep -m1 SYS_FAN_1|grep -oE '[0-9]+ RPM'|grep -oE '[0-9]+'; }
 gbusy(){ cat "$CARD"/gpu_busy_percent 2>/dev/null; }
-# hardware-fault detection: GPU RAS/ECC error counters + kernel-log fault scan
+cpubusy(){ LC_ALL=C mpstat 1 1 2>/dev/null | awk '/all/{i=$NF} END{if(i!="")printf "%.0f",100-i; else print "?"}'; }
+fanrpm(){ ipmitool sdr type Fan 2>/dev/null | grep -m1 "$1" | grep -oE '[0-9]+ RPM' | grep -oE '[0-9]+'; }
+
 FAULT_RE='amdgpu[^]]*(reset|hang|fault|timed? ?out|failed)|ring [a-z0-9_]+ (timeout|test failed)|GPU (fault|reset|hang)|VM_L2|VMC page fault|[Uu]ncorrectable|\b(ECC|EDC) error|RAS: |GECC|FWSM|Adapter removed|PCIe Bus Error|\bAER\b|Hardware Error|\bMCE\b'
 ecc(){ cat "$CARD"/ras/*_err_count 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+$/) s+=$i} END{print s+0}'; }
 kfaults(){ journalctl -k --since "@$1" --no-pager 2>/dev/null | grep -iE "$FAULT_RE"; }
 
-cleanup(){ docker rm -f soak-gpu >/dev/null 2>&1; pkill -f 'stress-ng' 2>/dev/null; pkill -x yes 2>/dev/null; pkill -9 -f nvmeheat 2>/dev/null; rm -f /data/.nvme_soak_test 2>/dev/null; }
+cleanup(){ pkill -f 'stress-ng' 2>/dev/null; pkill -x yes 2>/dev/null; }
 trap cleanup EXIT INT TERM
 
 if [ -n "$PROFILE" ]; then
   sed -i "s/^PROFILE=.*/PROFILE=$PROFILE/" /etc/gpu-fan-control.conf && systemctl restart gpu-fan-control && sleep 2
 fi
-echo "soak: load=$LOAD minutes=$MIN profile=${PROFILE:-<unchanged>} csv=$CSV"
+echo "soak: load=$LOAD min=$MIN cpu_pct=$CPU_PCT ngpu=$NGPU profile=${PROFILE:-<unchanged>} csv=$CSV"
 
-case "$LOAD" in gpu|both)
-  docker rm -f soak-gpu >/dev/null 2>&1
-  docker run -d --name soak-gpu --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined \
-    --group-add video -v /opt/models:/models:ro --entrypoint bash "$IMG" \
-    -c "while true; do /app/llama bench -m $MODEL -p 4096 -n 128 -ngl 99 -r 5; done" >/dev/null 2>&1 ;;
-esac
-case "$LOAD" in cpu|both|all)
-  # nice 19 so a full-core burn never starves sshd / the fan daemon
-  if command -v stress-ng >/dev/null 2>&1; then nice -n 19 stress-ng --cpu "$(nproc)" --timeout "$((MIN+1))m" >/dev/null 2>&1 &
-  else for _ in $(seq 1 "$(nproc)"); do nice -n 19 timeout "$((MIN+1))m" yes >/dev/null 2>&1 & done; fi ;;
-esac
-case "$LOAD" in nvme|all)   # high random-IO on the boot NVMe; nice+ionice so it yields to system IO
-  if command -v fio >/dev/null 2>&1; then
-    nice -n 19 ionice -c3 fio --name=nvmeheat --filename=/data/.nvme_soak_test --size=4G --rw=randrw \
-      --rwmixread=60 --bs=128k --iodepth=32 --numjobs=4 --direct=1 --runtime="$((MIN*60+10))" --time_based >/dev/null 2>&1 &
-  else echo "  (fio not installed; skipping nvme load)"; fi ;;
-esac
+# --- build ONE stress-ng invocation for the requested loads ---
+ARGS=()
+case "$LOAD" in cpu|both|all) ARGS+=(--cpu "$(nproc)" --cpu-load "$CPU_PCT") ;; esac
+case "$LOAD" in gpu|both|all) ARGS+=(--gpu "$NGPU") ;; esac
+if [ "${#ARGS[@]}" -gt 0 ]; then
+  nice -n 19 stress-ng "${ARGS[@]}" --timeout "$((MIN+1))m" --metrics-brief >/tmp/stress-ng.log 2>&1 &
+fi
 
 ALERTS=${CSV%.csv}.alerts.log; : > "$ALERTS"
-echo "epoch,gpu_junc,gpu_edge,cpu_tctl,fan_rpm,gpu_busy,ecc_err,kfaults" > "$CSV"
-echo "  time   gjunc gedge  cpu   fan     busy  ecc  flt"
+echo "epoch,cpu_busy,cpu_tctl,gpu_busy,gpu_junc,gpu_edge,fan_L,fan_R,ecc_err,kfaults" > "$CSV"
+echo "  time  CPU%  Tctl | GPU%  gjunc gedge |  fanL   fanR |  ecc flt"
 pj=0; pc=0; START=$(date +%s); END=$((START+MIN*60)); ECC0=$(ecc)
 while [ "$(date +%s)" -lt "$END" ]; do
-  j=$(gj); e=$(ge); c=$(ct); f=$(fan); b=$(gbusy); now=$(date +%s)
+  cb=$(cpubusy); c=$(ct); gb=$(gbusy); j=$(gj); e=$(ge); fl=$(fanrpm "$LFAN"); fr=$(fanrpm "$RFAN"); now=$(date +%s)
   ne=$(( $(ecc) - ECC0 )); nf=$(kfaults "$START" | wc -l)
   [ "$j" -gt "$pj" ] && pj=$j; [ "$c" -gt "$pc" ] && pc=$c
-  echo "$now,$j,$e,$c,${f:-0},${b:-0},$ne,$nf" >> "$CSV"
+  echo "$now,$cb,$c,${gb:-0},$j,$e,${fl:-0},${fr:-0},$ne,$nf" >> "$CSV"
   flag=""; { [ "$ne" -gt 0 ] || [ "$nf" -gt 0 ]; } && flag="  <-- FAULT!"
-  printf "  %4ds  %3sC  %3sC  %3sC %6s  %3s%%  %3s  %2s%s\n" "$((now-START))" "$j" "$e" "$c" "${f:-?}" "${b:-?}" "$ne" "$nf" "$flag"
+  printf "  %4ds %3s%%  %3sC | %3s%%  %3sC  %3sC | %5s  %5s | %3s %2s%s\n" \
+    "$((now-START))" "$cb" "$c" "${gb:-?}" "$j" "$e" "${fl:-?}" "${fr:-?}" "$ne" "$nf" "$flag"
   if [ "$j" -ge "$GABORT" ] || [ "$c" -ge "$CABORT" ]; then echo "  !! ABORT: gpu_junc=$j (cap $GABORT) cpu_tctl=$c (cap $CABORT)"; break; fi
   sleep 10
 done
-kfaults "$START" > "$ALERTS"
-cleanup
+kfaults "$START" > "$ALERTS"; cleanup
 FAULTS=$(wc -l < "$ALERTS"); ECCN=$(( $(ecc) - ECC0 ))
 echo "=== done. peak GPU junction=${pj}C  peak CPU Tctl=${pc}C  ECC errors=${ECCN}  kernel faults=${FAULTS} ==="
 if [ "$FAULTS" -gt 0 ] || [ "$ECCN" -gt 0 ]; then echo "--- FAULT LINES ($ALERTS) ---"; cat "$ALERTS"; else echo "  CLEAN: 0 ECC errors, 0 GPU/RAS/MCE/AER faults."; fi
-echo "  CSV=$CSV  ALERTS=$ALERTS"
+echo "  CSV=$CSV  ALERTS=$ALERTS  stress-ng metrics: /tmp/stress-ng.log"

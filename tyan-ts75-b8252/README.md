@@ -44,8 +44,11 @@ thermal guard under heavy load). Switch: edit the file, `systemctl restart gpu-f
 - **`gpu-thermal-guard.sh`** — GPU junction backstop: **duty-cycles** the GPU (SIGSTOP/CONT the `/dev/kfd`
   process) if junction ≥ HOT (default 100 °C), pure GPU-side. (Clock-capping is a no-op on this board under
   load — see *GPU thermal lever* below.)
-- **`tyan-thermal-soak.sh`** — fault/ECC-aware soak: `[gpu|cpu|nvme|both|all] [minutes] [profile]`;
-  logs GPU/CPU/fan/ECC/faults to CSV, aborts on GPU 100 °C / CPU 95 °C, scans RAS/ECC/MCE/AER
+- **`tyan-thermal-soak.sh`** — **model-free** controlled load + **verify** + monitor. Drives CPU and GPU
+  with one general tool (**stress-ng**): `CPU_PCT=50 tyan-thermal-soak.sh [gpu|cpu|both] [minutes] [profile]`.
+  Every few seconds it prints the **actual achieved load** (CPU busy% via `mpstat`, GPU busy% via sysfs)
+  next to CPU Tctl / GPU junction+edge / **left+right fan RPM**, logs a CSV, scans RAS/ECC/MCE/AER, and
+  aborts on GPU 100 °C / CPU 95 °C. No llama.cpp, no model, no VRAM juggling — see *Testing & troubleshooting*.
 - **`systemd/`** — the units + fail-safe restore service
 
 ## Safety / robustness
@@ -78,6 +81,52 @@ order:
 > likeliest cause, but board and workload aren't ruled out. Takeaway regardless: **under ROCm here, don't rely
 > on clock-capping — request-throttling is the reliable lever.** To settle it, retest Vulkan-vs-ROCm on the
 > *same* box + model (if Vulkan honors down-clocking for Qwen3-VL-32B, it'd be a cheaper heat lever than the gate).
+
+## Testing & troubleshooting
+
+### Independent thermal test — no model, no app
+`tyan-thermal-soak.sh` drives **both** loads with one general tool (**stress-ng**), so you can
+characterise cooling with **nothing from the OCR/LLM stack running** — no llama.cpp, no model, no VRAM to
+free. It prints the *measured* load each sample, so you never have to trust an assumption:
+
+```sh
+CPU_PCT=50  ./tyan-thermal-soak.sh both 2     # 50% CPU + GPU, 2 min  (partial-load baseline)
+CPU_PCT=100 ./tyan-thermal-soak.sh both 3     # flat-out: 100% CPU + GPU, 3 min
+CPU_PCT=100 ./tyan-thermal-soak.sh cpu  2     # CPU only
+            ./tyan-thermal-soak.sh gpu  2     # GPU only (stress-ng --gpu, Mesa/radeonsi GL)
+```
+Columns: `CPU%` (mpstat) · `Tctl` · `GPU%` (sysfs) · `gjunc/gedge` · `fanL/fanR` RPM · `ecc/flt`.
+`CPU_PCT` loads *every* core to that percent; `NGPU=n` adds GPU workers. Aborts at CPU 95 °C / GPU 100 °C.
+Prereqs: `apt install stress-ng sysstat ipmitool` + the `gpu-fan-control` service. The GPU stressor needs
+Mesa `radeonsi`/GL on the card (present on the V620 via `/dev/dri/renderD*`).
+
+**Measured baselines** (V620 + one EPYC 7R12, `max-quiet`, 50 % duty cap, chassis half-taped):
+
+| Load (verified) | CPU Tctl | GPU junction | Fans (duty → RPM) | Faults |
+|---|---|---|---|---|
+| 50 % CPU + GPU | 57 → 69 °C | ≤ 87 °C | L 20–50 % / R 30–60 % · 7.3–12 k / 9.3–14 k | 0 |
+| 100 % CPU + GPU | **69 °C flat** | ≤ 92 °C | same caps, spikes 13 k / 15 k | 0 |
+
+Takeaway: the CPU has **enormous** headroom (69 °C flat-out vs the 95 °C abort); the **GPU junction is the
+limiter**, held ~90 °C by the app temp-gate + the 50 % fan cap (fans never scream — junction rides ~90 °C
+instead of the fans hitting 100 %).
+
+### Troubleshooting fan profiles
+The daemon logs **every duty change** — first place to look:
+```sh
+journalctl -t gpu-fan-control -f
+#  gpu=77/95/vram68 cpu=58 nvme=35 mem=41 -> L=50% R=60% (cap50 g21 c18 n15 m12 valve56)
+#      edge/junc/vram  Tctl                   LEFT RIGHT   daycap  per-curve duties   safety-valve
+```
+Read it: each device curve duty (`g`pu/`c`pu/`n`vme/`m`em) and the `valve` (critical cascade) are max’d,
+the day/night `cap` trims the **cooling** bank, then **`MAX_DUTY` clamps the result** (above: the valve
+wanted 56 %, got clamped to 50). `R = L + RIGHT_BOOST`. Common cases:
+
+- **Too loud** → lower `MAX_DUTY` / `DAY_CAP` / `NIGHT_CAP` / `RIGHT_BOOST` in `/etc/gpu-fan-control.conf`, then `systemctl restart gpu-fan-control`. RPM is very non-linear (50 % ≈ 13 k RPM, 20 % ≈ 7 k).
+- **GPU too hot** → the flip side: raise `MAX_DUTY`, or pace the workload (*GPU thermal lever* above). You can't out-cool a passive card under a low cap.
+- **A fan won't respond** → drive it directly and watch RPM: `ipmitool raw 0x2e 0x05 0xfd 0x19 0x00 <PWM> 0x32` (50 %), then `ipmitool sdr type Fan`. Restore with `0xff`. PWM↔fan map is in *What it covers*.
+- **Fans pinned at the ~3.5 k floor or full 100 %** → the daemon died and it failed safe to BMC auto (`0xff`). Check `systemctl status gpu-fan-control` + `journalctl -u gpu-fan-control`.
+- **Sanity-check the whole control loop** → `./tyan-thermal-soak.sh gpu 2` while watching `journalctl -t gpu-fan-control -f`: junction should climb, duty should track it, fans should fall back when load stops.
 
 ## Install
 ```sh
