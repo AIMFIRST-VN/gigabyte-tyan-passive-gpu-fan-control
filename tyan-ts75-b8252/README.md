@@ -63,7 +63,11 @@ core still runs ~2400 MHz and `power1_cap` is firmware-locked at 250 W, so junct
 order:
 1. **Throttle the requests** — pace vision calls by junction temp on the *application* side (our Laravel
    temp-gate waits until junction < gate before each call, serialized to one). This is the primary lever.
-2. **Less work per call** — `--image-max-tokens` (512 verified good), batch size (`-ub` / `--mtmd-batch-max-tokens`).
+2. **Give llama.cpp less to do (lower-performance server settings)** — trade throughput for lower *sustained*
+   GPU power at the source, since we can't down-clock the card: lower `--image-max-tokens` (512 verified good),
+   smaller prefill batches (`-ub` / `--mtmd-batch-max-tokens` / `-b`), fewer `--parallel` slots, or partial CPU
+   offload (`-ngl` below all layers). Less compute per second ⇒ lower junction — the flip side of "the GPU
+   won't slow down on command, so hand it a smaller job."
 3. **Duty-cycle** — `gpu-thermal-guard` SIGSTOP/CONT between calls (coarse; cannot stop a running kernel).
 4. **Fans + accept the heat** — cap fans (`MAX_DUTY`) and accept ~100 °C (Tjmax 110) rather than let them scream.
 
