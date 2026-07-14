@@ -33,7 +33,7 @@ gpu_pids(){
 do_cap(){ echo manual > "$D"/power_dpm_force_performance_level 2>/dev/null; echo 1 > "$D"/pp_dpm_sclk 2>/dev/null; capped=1; }
 un_cap(){ echo auto   > "$D"/power_dpm_force_performance_level 2>/dev/null; capped=0; }
 resume(){ [ -n "$paused_pids" ] && kill -CONT $paused_pids 2>/dev/null; paused_pids=""; }
-release(){ resume; un_cap; state=normal; }
+release(){ resume; [ "$capped" = 1 ] && un_cap; state=normal; }   # only revert OUR clock-cap; leave an external manual cap (quiet mode) alone
 cleanup(){ release; exit 0; }
 trap cleanup TERM INT
 

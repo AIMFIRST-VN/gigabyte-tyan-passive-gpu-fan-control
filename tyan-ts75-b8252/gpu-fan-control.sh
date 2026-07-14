@@ -14,6 +14,18 @@ set -u
 CONF=/etc/gpu-fan-control.conf; [ -f "$CONF" ] && . "$CONF"
 PROFILE=${PROFILE:-max-quiet}; INTERVAL=${INTERVAL:-4}
 PWMS="2 3 4 5 6 0"; IANA="0xfd 0x19 0x00"
+# Left/right split (chassis, seen from the FRONT): SYS_FAN_1..3 = PWM 2,3,4 (LEFT, over the GPU) do the cooling;
+# SYS_FAN_4..6 = PWM 5,6,0 (RIGHT) run minimal for noise. The SAFETY VALVE overrides BOTH toward 100%.
+LEFT_PWMS="${LEFT_PWMS:-2 3 4}"; RIGHT_PWMS="${RIGHT_PWMS:-5 6 0}"
+RIGHT_MIN=${RIGHT_MIN:-15}          # right-bank floor % (noise). The GPU is the LEFT bank's job, so a hot GPU does
+                                    # NOT ramp the right bank (see below) — only a CPU/NVMe/mem emergency does.
+# Day/night noise CAP on the (left) cooling fans -- host clock is Asia/Ho_Chi_Minh. Quieter at night; the GPU
+# temp-gate on the app side paces work so a capped fan doesn't overheat (the valve is the hard safety net).
+DAY_START=${DAY_START:-7}; DAY_END=${DAY_END:-19}; DAY_CAP=${DAY_CAP:-50}; NIGHT_CAP=${NIGHT_CAP:-25}
+# HARD ceiling on EVERY bank, including the safety valve — a noise budget. GPU thermal is instead managed by
+# the Laravel request temp-gate (paces calls) + gpu-thermal-guard (SIGSTOPs the GPU proc at CRIT); we accept
+# ~100°C rather than let fans scream. Set MAX_DUTY=100 to restore valve-to-full behaviour.
+MAX_DUTY=${MAX_DUTY:-50}
 MEM_EVERY=${MEM_EVERY:-6}          # re-read BMC memory temps every N loops (ipmitool SDR is slow)
 
 # ---- discover every AMD GPU / CPU socket / NVMe ----
@@ -62,24 +74,41 @@ valve(){ local m=0 x   # args: cpu gpu_junc vram nvme mem
   for x in "$(ramp "$1" $CPU_CRIT_LO $CPU_CRIT_HI)" "$(ramp "$2" $GPU_CRIT_LO $GPU_CRIT_HI)" "$(ramp "$3" $VRAM_CRIT_LO $VRAM_CRIT_HI)" "$(ramp "$4" $NVME_CRIT_LO $NVME_CRIT_HI)" "$(ramp "$5" $MEM_CRIT_LO $MEM_CRIT_HI)"; do
     [ "$x" -gt "$m" ] && m=$x; done; echo "$m"; }
 
+# Time-of-day cap on the cooling fans (host TZ = ICT). Day [DAY_START,DAY_END) => DAY_CAP, else NIGHT_CAP.
+day_cap(){ local h; h=$(date +%H); h=${h#0}; h=${h:-0}
+  if [ "$h" -ge "$DAY_START" ] && [ "$h" -lt "$DAY_END" ]; then echo "$DAY_CAP"; else echo "$NIGHT_CAP"; fi; }
+
 setfan(){ timeout 5 ipmitool raw 0x2e 0x05 $IANA "$1" "$2" >/dev/null 2>&1; }
 restore(){ for p in $PWMS; do timeout 5 ipmitool raw 0x2e 0x05 $IANA "$p" 0xff >/dev/null 2>&1; done; }
 trap 'restore; exit 0' TERM INT
 
 logger -t gpu-fan-control "started profile=$PROFILE int=${INTERVAL}s gpus=$(echo $GPUS|wc -w) cpu_sockets=$(echo $CHWS|wc -w) nvme=$(echo $NVMES|wc -w)"
 SDN=$(command -v systemd-notify 2>/dev/null); [ -n "$SDN" ] && "$SDN" --ready 2>/dev/null   # Type=notify readiness
-last=-1; i=0; mt=0
+lastL=-1; lastR=-1; i=0; mt=0
 while :; do
   [ -n "$SDN" ] && "$SDN" WATCHDOG=1 2>/dev/null                                            # heartbeat (WatchdogSec)
   [ $(( i % MEM_EVERY )) -eq 0 ] && mt=$(mem_read); mt=${mt:-0}; i=$((i+1))
   ge=$(gpu_edge); gj=$(gpu_junc); gv=$(gpu_vram); ct=$(cpu_temp); nt=$(nvme_temp)
   dg=$(interp "$ge" "$(gpu_curve)"); dc=$(interp "$ct" "$(cpu_curve)"); dn=$(interp "$nt" "$(nvme_curve)"); dm=$(interp "$mt" "$(mem_curve)"); dv=$(valve "$ct" "$gj" "$gv" "$nt" "$mt")
-  d=$dg; for x in $dc $dn $dm $dv; do [ "$x" -gt "$d" ] && d=$x; done
-  [ "$d" -gt 100 ] && d=100; [ "$d" -lt 0 ] && d=0
-  if [ "$d" -ne "$last" ]; then
-    hex=$(printf '0x%02x' "$d"); for p in $PWMS; do setfan "$p" "$hex"; done
-    logger -t gpu-fan-control "gpu=${ge}/${gj}/vram${gv} cpu=${ct} nvme=${nt} mem=${mt} -> ${d}% (g$dg c$dc n$dn m$dm valve$dv)"
-    last=$d
+  # cooling duty from the curves (NO valve yet — the valve is allowed to EXCEED the noise cap)
+  dcool=$dg; for x in $dc $dn $dm; do [ "$x" -gt "$dcool" ] && dcool=$x; done
+  cap=$(day_cap); [ "$dcool" -gt "$cap" ] && dcool=$cap          # day/night noise cap on the cooling bank
+  # LEFT bank cools (capped); RIGHT bank stays minimal for noise; the safety VALVE overrides BOTH.
+  dl=$dcool; [ "$dv" -gt "$dl" ] && dl=$dv
+  # RIGHT bank: the GPU is the LEFT bank's job, so exclude the GPU junction/VRAM layers from its stack — the
+  # right bank only ramps on its OWN emergency (CPU / NVMe / memory crit). "Max layered wins", but the GPU
+  # layer is no longer IN the right stack, so a hot GPU never spins the right fans up.
+  dvr=0; for x in "$(ramp "$ct" "$CPU_CRIT_LO" "$CPU_CRIT_HI")" "$(ramp "$nt" "$NVME_CRIT_LO" "$NVME_CRIT_HI")" "$(ramp "$mt" "$MEM_CRIT_LO" "$MEM_CRIT_HI")"; do [ "$x" -gt "$dvr" ] && dvr=$x; done
+  dr=$RIGHT_MIN; [ "$dvr" -gt "$dr" ] && dr=$dvr
+  # HARD ceiling (noise budget) — caps even the valve; thermal safety falls to the temp-gate + thermal-guard.
+  [ "$dl" -gt "$MAX_DUTY" ] && dl=$MAX_DUTY; [ "$dl" -lt 0 ] && dl=0
+  [ "$dr" -gt "$MAX_DUTY" ] && dr=$MAX_DUTY; [ "$dr" -lt 0 ] && dr=0
+  if [ "$dl" -ne "$lastL" ] || [ "$dr" -ne "$lastR" ]; then
+    hl=$(printf '0x%02x' "$dl"); hr=$(printf '0x%02x' "$dr")
+    for p in $LEFT_PWMS; do setfan "$p" "$hl"; done
+    for p in $RIGHT_PWMS; do setfan "$p" "$hr"; done
+    logger -t gpu-fan-control "gpu=${ge}/${gj}/vram${gv} cpu=${ct} nvme=${nt} mem=${mt} -> L=${dl}% R=${dr}% (cap${cap} g$dg c$dc n$dn m$dm valve$dv)"
+    lastL=$dl; lastR=$dr
   fi
   sleep "$INTERVAL"
 done

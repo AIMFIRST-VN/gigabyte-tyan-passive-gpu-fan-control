@@ -27,6 +27,18 @@ whole family — all with the same BMC and the same fan-control gap:
 - **1U:** Gigabyte R182-Z90 / Z91 / Z92 / Z93
 - plus other Gigabyte EPYC servers with the same MegaRAC BMC.
 
+### Also: Tyan TS75-B8252 — in-band IPMI variant
+
+A parallel implementation for the **Tyan TS75-B8252 / motherboard S8252** lives in
+[`tyan-ts75-b8252/`](tyan-ts75-b8252/). Same problem (a passive GPU the BMC won't cool), different
+control surface: that board's BMC (also AMI MegaRAC / AST2500) exposes **no** web-UI or Redfish fan
+control — it's reachable **only** through Tyan's **OEM IPMI** command set, in-band via `/dev/ipmi0`
+(`netfn 0x2e`, Tyan IANA `fd 19 00`). So rather than rewriting a BMC fan profile, the Tyan port is a
+host-side daemon that drives the six chassis fans directly with `ipmitool raw`, using the same
+"hottest device wins" control law — plus left/right fan-bank zoning (cool the GPU on one side, keep
+the other minimal), a day/night noise cap, and a hard duty ceiling. Details in
+[`tyan-ts75-b8252/README.md`](tyan-ts75-b8252/README.md).
+
 ## The problem
 
 A passive datacenter GPU has no onboard fan — it lives entirely on chassis air.

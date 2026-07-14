@@ -41,8 +41,9 @@ thermal guard under heavy load). Switch: edit the file, `systemctl restart gpu-f
 
 ## Components
 - **`gpu-fan-control.sh`** — the fan daemon
-- **`gpu-thermal-guard.sh`** — GPU junction backstop: duty-cycles (SIGSTOP/CONT the `/dev/kfd`
-  process) or clock-caps the GPU if junction ≥ HOT (default 100 °C), pure GPU-side
+- **`gpu-thermal-guard.sh`** — GPU junction backstop: **duty-cycles** the GPU (SIGSTOP/CONT the `/dev/kfd`
+  process) if junction ≥ HOT (default 100 °C), pure GPU-side. (Clock-capping is a no-op on this board under
+  load — see *GPU thermal lever* below.)
 - **`tyan-thermal-soak.sh`** — fault/ECC-aware soak: `[gpu|cpu|nvme|both|all] [minutes] [profile]`;
   logs GPU/CPU/fan/ECC/faults to CSV, aborts on GPU 100 °C / CPU 95 °C, scans RAS/ECC/MCE/AER
 - **`systemd/`** — the units + fail-safe restore service
@@ -53,6 +54,26 @@ thermal guard under heavy load). Switch: edit the file, `systemctl restart gpu-f
   `ipmitool` call is `timeout`-wrapped so it can't hang
 - **High priority** — `Nice=-10`, `OOMScoreAdjust=-900`
 - **Hardware throttle / THERMTRIP shutdown is the ultimate backstop** under all of the above
+
+## GPU thermal lever — pace requests, don't clock-cap (Tyan finding)
+On **this board** the V620 **ignores OS-level down-clocking under `llama.cpp` compute**: setting
+`power_dpm_force_performance_level=low` (or `manual` + a `pp_dpm_sclk` mask) reads back as applied, yet the
+core still runs ~2400 MHz and `power1_cap` is firmware-locked at 250 W, so junction pins at ~100 °C regardless;
+`SIGSTOP` can't even interrupt an in-flight prefill kernel. So the things that actually move GPU heat are, in
+order:
+1. **Throttle the requests** — pace vision calls by junction temp on the *application* side (our Laravel
+   temp-gate waits until junction < gate before each call, serialized to one). This is the primary lever.
+2. **Less work per call** — `--image-max-tokens` (512 verified good), batch size (`-ub` / `--mtmd-batch-max-tokens`).
+3. **Duty-cycle** — `gpu-thermal-guard` SIGSTOP/CONT between calls (coarse; cannot stop a running kernel).
+4. **Fans + accept the heat** — cap fans (`MAX_DUTY`) and accept ~100 °C (Tjmax 110) rather than let them scream.
+
+> **Caveat — three confounds, not isolated:** the earlier test where the *same* GPU DID respond to clock/power
+> throttling differed in **three** ways at once — **board** (Gigabyte R282), **backend** (`llama.cpp` **Vulkan**),
+> and **model** (`ornith`, text-only). This Tyan setup is **ROCm** + **Qwen3-VL-32B** (vision). So the no-op
+> isn't pinned to any single variable: the **backend** (Vulkan honoring down-clock vs ROCm ignoring it) is the
+> likeliest cause, but board and workload aren't ruled out. Takeaway regardless: **under ROCm here, don't rely
+> on clock-capping — request-throttling is the reliable lever.** To settle it, retest Vulkan-vs-ROCm on the
+> *same* box + model (if Vulkan honors down-clocking for Qwen3-VL-32B, it'd be a cheaper heat lever than the gate).
 
 ## Install
 ```sh
